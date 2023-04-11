@@ -1,0 +1,343 @@
+---
+title: "CFTC Scrapying"
+output: html_document
+date: "2023-02-10"
+---
+
+# CFTC交易資訊查詢
+
+在CFTC網站上有根據每個交易所有不同的商品的交易情況，還有根據是否有選擇權以及格式做分類。本次想要查詢的是僅期貨（不含選擇權），並且長型格式，商品項目有原油、天然氣、玉米、大豆、小麥、糖。需要注意的事項是每個品項都分散在不同的交易所，並且因為年代久遠，商品名稱可能發生改變，或者出現相當類似的商品名稱，再者報告發布時間不完全是每週的第幾天，部分天數及年份發生偏移，因此在開始之前，必須先釐清交易日以及商品項目。
+
+Historical Viewable: <https://www.cftc.gov/MarketReports/CommitmentsofTraders/HistoricalViewable/index.htm>
+
+### Packages
+
+```{r}
+library(rvest)
+library(stringr)
+library(dplyr)
+library(lubridate)
+library(car)
+library(openxlsx)
+```
+
+### Date
+
+CFTC網站中最早的資料為`2005/1/4`，而目前最新的發布日是`2023/1/24`，因此我們建立一個從開始是最新的時間格式向量，`by`指定間隔為`7`日。
+
+```{r date seq}
+
+# day <- seq(date("2005-01-04"), Sys.Date(), by = 7)
+
+day <- seq(date("2005-01-04"), date("2023-01-24"), by = 7) 
+
+head(day)
+```
+
+由於部分的時間可能提早或是延後或者取消，有多種分法可以得知是哪幾次的發布時間並不固定，目前是使用迴圈以及`try`函數，檢查何日無法查詢，在對應到網頁上確認實際發布的情況。以下是已經確認的的不固定的發布，`delete`中是應發布但為發布的日期，`add`則是不應發布但發布的日期，再來使用向量的加減，確認時即有發布的日期。
+
+```{r delete}
+delete <- c("083005", "010207", "070406", "010108", "122507", "111009", "122308", 
+	"010113", "122512", "070417", "010119", "122518", "122220") 
+
+delete <- as.Date(delete, "%m%d%y")
+```
+
+```{r add}
+add <- c("010307", "070306", "123107", "122407", "110909", "122208", 
+	"123112","122412", "070317", "123118", "122418", "122120")
+
+add <- as.Date(add, "%m%d%y")
+```
+
+先將原本固定的`day`和需要加上的`add`合併，然後選取`day`中和`delete`不同的元素，`!`表示相反，`%in%`表示屬於，`[]`內表示篩選的條件。
+
+```{r +- }
+day <- c(day, add)
+
+day <- day[! day %in% delete]
+```
+
+由於目前的向量並非完全按照時間順序排列，因此我們將向量重新排序，使用`sort`函數。
+
+```{r sort}
+day <- sort(day)
+```
+
+由於在`url`中會有用到日期和年份，因此使用`year`函數將日期格式轉換成年。在查詢的過程中，網站使用的日期格式是月日年（兩位），因此我們用`format`將日期格式轉換成指定的格式，`%m`表示數字月份，`%d`是日期，`%y`是年份後兩位，如2023/02/13就會是`021323`。
+
+```{r mdy}
+year <- year(day)
+
+day <- format(day, "%m%d%y")
+
+head(day)
+```
+
+以下是特殊的的元素轉換，若使用`recode`函數修改的話格式會跑掉，不建議直接使用。
+
+```{r else}
+year[which(day == "123113")] <- "2014"
+
+# day <- car::recode(day, "'120214' = '120614';
+#               '112514' = '112914';
+#               '122419' = '123019'")
+
+day[which(day == "120214")] <- "120614"
+day[which(day == "112514")] <- "112914"
+day[which(day == "122419")] <- "123019"
+
+```
+
+## URL
+
+本次需要用的的交易所資料分別是New York Mercantile Exchange、Chicago Board of Trade、ICE Futures U.S.。分別對應的字母縮寫是nyme、cbt、nybt。在`url`中可以注意的是futures表示僅期貨，lf是long format。若未來需要查詢其他的項目或是格式，可以自行更改。
+
+`str_glue`的功能是插補字串的內容，`{}`內分入需要差補的內容。由於我們的`year`和`day`長度是對應的，因此同時放入函數中，就會同時將兩個向量的第一個元素插補到字串，形成新向量的第一個元素。
+
+`url`的內容可以先用外部瀏覽器進入查看，，以下是New York Mercantile Exchange所發佈的2023/1/3僅期貨的長格式報告，<https://www.cftc.gov/sites/default/files/files/dea/cotarchives/2023/futures/deanymelf010323.htm>，可以先進入熟悉一下接下來操作的對象。
+
+例如url_nyme就是New York Mercantile Exchange的每一日報告的網址所組成的向量，其他交易所也如此。
+
+```{r url}
+url_nyme <- str_glue("https://www.cftc.gov/sites/default/files/files/dea/cotarchives/{year}/futures/deanymelf{day}.htm")
+
+url_cbt <- str_glue("https://www.cftc.gov/sites/default/files/files/dea/cotarchives/{year}/futures/deacbtlf{day}.htm")
+
+url_nybt <- str_glue("https://www.cftc.gov/sites/default/files/files/dea/cotarchives/{year}/futures/deanybtlf{day}.htm")
+```
+
+```{r }
+head(url_nyme)
+```
+
+因為我們接下來需要對三組向量做相同的動作，因為網址內的內容格式相同，所以我們可以將接下來的操作寫成函數，在分別帶入不同的向量。
+
+我們希望將網頁的內容先全部抓取，以及簡單的整理，尚且先不涉及至商品。由於函數內的物件無法直接查看，因此我們先用低一個`url`進行示範，逐步了解接下來的操作。先指定`url_ex`是`url_nyme`中的第一個元素，因此`url_ex`是一個網址。再來利用`read_html`讀取網頁，輸出的結果就是一份html文件，html文件由節點組成。
+
+```{r example html}
+
+url_ex <- url_nyme[1]
+
+url_ex %>% read_html
+
+```
+
+因此我們用`html_nodes`找到pre的節點，這個節點內存放了我們想要的內容，接下來`html_text`將html物件轉換成文字。此時所有的內容會變成一個字串，我們可以用換行符號為間隔，將一個有全部內容的字串切割成一行一個字串，`str_split`就是將字串切割，參數放入以什麼字為間隔切割，`\r\n`或者`\n`是換行符號，`|`是邏輯運算，表示或(or)。因此`"\r\n|\n"`表示遇到`\r\n`或者`\n`時進行分隔。
+
+但因為分隔是在該元素進行操作，因此分割的內容會再被一個list包起來，會形成一個list，其中的一個元素是一個切割後的向量，我們可以使用`unlist`展開，把整個物件變成一個向量，相當於除去最外層的list。
+
+因為這個物件包含了所有的商品，我們先顯示第一個商品的內容，我們想要的數據是在商品中的第11行的位置。
+
+```{r example nodes}
+
+report_ex <- url_ex %>% 
+              read_html %>%
+              html_nodes("pre") %>% 
+              html_text %>% 
+              str_split("\r\n|\n") %>% 
+              unlist
+
+head(report_ex, 36)
+
+```
+
+我們可以將上述的操作寫成一個自定義的函數，`function(url){}`，小括號內是要輸入到函數的內容，大括號內放入需要對輸入進行的操作，記得這個操作最後要有產出，或者使用`return()`指定產出。我將這個產出取名為`ask`。注意，我們這裡定義的輸入是一個`url`，而不是由很多`url`組成的向量。
+
+```{r ask}
+
+ask <- function(url){
+  
+  url %>% 
+    read_html %>% 
+    html_nodes("pre") %>% 
+    html_text %>% 
+    str_split("\r\n") %>% 
+    unlist
+  
+}
+```
+
+接下來我們要把一個包含很多`url`的向量放入`ask`這個函數中。接下來介紹一個重要的函數，`lapply(X, FUN, ...)`，X是一個物件，FUN是一個函數`lapply`的功能是將X這個物件中的每一個物件分別帶入至FUN指定的函數，再將每一個產出合併成一個list。所以`lapply(url_nyme, ask)`的動作就是將`url_nyme`中的每一個元素(url)帶入至`ask`，每一個url都會產生一個帶有很多句子的向量，接下來這些很多句子的向量合併成一個list。我們利用`str`查看report_nyme的結構，可以看到這是一個含有942個元素的物件，一個元素表示一個url產出的內容，也就是一天的報告。而第一個元素是一個有614個字串組成的向量，一個字串表示一行的內容。
+
+```{r}
+
+report_nyme <- lapply(url_nyme, ask)
+
+report_cbt <- lapply(url_cbt, ask)
+
+report_nybt <- lapply(url_nybt, ask)
+
+```
+
+```{r}
+str(report_nyme, list.len = 2)
+```
+
+### Commodities
+
+然而在一份報告中有很多的商品，而我們只想要部分商品的數據。在報告中會有一行表示商品的名稱，接下來才是該商品的數據。因此我們需要先找的我們要的商品在第幾行，再來選取數據。 我們先用搜尋原油作為例子，原由位於report_nyme中。`report_nyme`是一份很多報告的list，`report_nyme[[1]]`是在這份list中選取第一個元素，也就是第一天的報告。接下來使用`str_detect`搜尋這份報告，第一個變數放入要搜尋的範圍，第二個變數放謠搜尋字詞的形式，若符合形式則回`TRUE`。因此這裡的作用是在報告中偵測每一行是否有出現"WTI-PHYSICAL"或"CRUDE OIL, LIGHT SWEET"，只要符合任一條件則回傳`TRUE`。但是我們想要任一上述兩個字串，但不要商品名中有"E-MINY"，也就是有可能會同時出現"WTI-PHYSICAL, E-MINY"以及"WTI-PHYSICAL"，但我們只想要"WTI-PHYSICAL"不要"WTI-PHYSICAL, E-MINY"。因此我們再加一個條件偵測是否出現"E-MINY"，再加上`!`表示相反，因此整體的條件是當出現"WTI-PHYSICAL"或"CRUDE OIL, LIGHT SWEET"，並且沒有"E-MINY"時才會回傳`TRUE`。 此時`index_crude_oil`是一個只有包含`TRUE`或`FALSE`的向量，`TRUE`的位置表示商品的名稱在第幾行。使用`which`會回傳`TRUE`的位置，我們可以看到目前原油的商品名稱在報告的第397行。而一個商品的所有資訊大約是36行，因此我們選取該商品名稱到36行之後，再者裡相當於我們要在報告中選取397\~433行，`:`表示從幾到幾，`1:3`表示1, 2, 3。
+
+```{r}
+index_crude_oil <- str_detect(report_nyme[[1]], "WTI-PHYSICAL|CRUDE OIL, LIGHT SWEET") &
+  !(str_detect(report_nyme[[1]], "E-MINY"))
+
+which(index_crude_oil)
+```
+
+```{r}
+report_nyme[[1]][which(index_crude_oil):(which(index_crude_oil) + 35)]
+```
+
+從報告中可以看到我們想要的數據在第11行，因此將其單獨選取出來。這幾個數字就是我們想要的數據。
+
+```{r}
+row_crude_oil <- report_nyme[[1]][which(index_crude_oil) + 10]
+
+row_crude_oil
+```
+
+但目前所有數字都被寫在同一個字串，裡面還有許多我們不想要的符號。我們先將這個字串做分割，可以觀察到每個字串之間都有空格，因此使用空格作為分割間隔。`str_split`可以將字串依據給定的形式分隔，這裡指定當字串遇到" "的時候就分割。
+
+```{r}
+row_crude_oil <- str_split(row_crude_oil, " ")
+
+row_crude_oil
+```
+
+```{r}
+row_crude_oil <- unlist(row_crude_oil)
+
+row_crude_oil
+```
+
+順便將分割的內容的list階層移除，就會得到一個有所有元素的字串向量。 在row_crude_oil中選取那些不包含`"All", "", ":"`的元素，`%in%`是包含、屬於的意思。`[]`表示條件，選取符合條件的元素。可以看到在執行完成後，目前只剩下有數字的元素。
+
+```{r}
+row_crude_oil <- row_crude_oil[! row_crude_oil %in% c("All", "", ":")]
+
+row_crude_oil
+```
+
+我們需要進一步將元素內不是數字的部分清除掉，這裡用到`str_remove_all`，如同名字一樣，他可以移除掉所有符合條件的文字。我們這裡看到要移除的分別是`,`以及`:`，也此我們可以設定條件`",|:"`，`|`表示或者的意思。在確保元素內都是數字後，就可以使用`as.numeric`將字串轉換為數字。自此就得到我們想要的數據。
+
+```{r}
+row_crude_oil <- str_remove_all(row_crude_oil, ",|:")
+
+row_crude_oil
+
+row_crode_oil <- as.numeric(row_crude_oil)
+```
+
+由於多數商品在命名上的有需要包含的文字，以及同時不要包含的文字，因此我們將這兩種條件先編輯好，方便後去使用function的時候帶入。第一個元素是需要包含的字串，第二個元素是不需要包含的，若無特別不需要包含的字串，我們使用9999999作為代替，因為不會有99999999，`str_detect`函數會回傳`FALSE`，而經過相反後為`TRUE`。
+
+```{r conditions}
+
+crude_oil_condi <- c("WTI-PHYSICAL|CRUDE OIL, LIGHT SWEET", "E-MINY")
+
+natural_gas_condi <- c("NATURAL GAS|NAT GAS NYME", "E-MINY")
+
+corn_condi <- c("CORN", "9999999")
+
+soybean_condi <- c("SOYBEANS", "MINI SOYBEANS")
+
+sugar_condi <- c("SUGAR NO. 11", "9999999")
+
+wheat_condi <- c("WHEAT", "999999")
+
+```
+
+我們將上述動作合併成一個function，程式名為`getrow`，就是報告中找出目標的文字，再轉換成數字。而函數中需要放入的參數有`report`，即要從哪個報告中找，第二個參數是`condition`，就是篩選資料的條件，每個條件會對應到一個商品。將這些操作合併成一個function的好處是因為我們有多個商品，但執行的動作卻相當類似，因此可以增加效率，並使程式碼更加簡潔。
+
+```{r getrow}
+
+getrow <- function(report, condition){
+  
+  index <- str_detect(report, condition[1]) &
+		 !(str_detect(report, condition[2]))
+  
+  report[which(index) + 10] %>% 
+    str_split(" ") %>% 
+    unlist %>% 
+    .[!(. %in% c("All", ":", ""))] %>% 
+    str_replace_all("[:,]", "") %>% 
+    as.numeric()
+  
+}
+```
+
+`lapply`函數可以將參數`X`依次帶入至`FUN`指定的函數，接下來的參數就是補充到`FUN`的參數。這裡的`X`是很多報告組成的list，而`lapply`就會將這個list依序帶入函數，也就是將每一份報告代入到`getrow`函數。最後函數會將每一次帶入的結果合併成一個list。所以現在產出的`report_crude_oil`是由很多數字向量組成的list。
+
+```{r lapply}
+report_crude_oil <- lapply(X = report_nyme, FUN = getrow, crude_oil_condi)
+report_natural_gas <- lapply(report_nyme, getrow, natural_gas_condi)
+
+report_corn <- lapply(report_cbt, getrow, corn_condi)
+report_soybean <- lapply(report_cbt, getrow, soybean_condi)
+report_wheat <- lapply(report_cbt, getrow, wheat_condi)
+
+report_sugar <- lapply(report_nybt, getrow, sugar_condi)
+```
+
+```{r}
+head(report_corn)
+```
+
+## Combine
+
+接著我們想把這個list轉換成data frame，因為這樣可以更方便操作以及輸出。`rbind`是將兩個物件以row的方向合併，`do.call`則是對所有物件進行同樣的操作，因此將這兩個函數合併使用就是將所有物件以row方向合併。`as.data.frame`則是將物件轉換成data frame形式。`cbind`則是將兩個物件以column方向合併。`mdy`可以將依照month/day/year的字串轉換成日期格式，類似的函數還有很多格式。`colnames(df)`可以提取df的colnames，接著我們將colnames指定城該資料所代表的變數。為了使操作更加快速，我們把這些操作合併成一個function，所以我們只要將輸入替換成其他商品的報告，就可以達到同樣的效果。
+
+```{r combin}
+combin <- function(report){
+  
+  df <- report %>% 
+    do.call(rbind, .) %>% 
+    as.data.frame() %>%
+    cbind(mdy(day), .)
+  
+  colnames(df) <- c("Date", "Total_Open_Interest",
+                    "Non-Comercial_Long", "Non-Comercial_Short",
+                    "Non-Comercial_Spreading", 
+                    "Comercial_Long", "Comercial_Short", 
+                    "Total_Long", "Total_Short",
+                    "Nonreportable_Positions_Long",
+                    "Nonreportable_Positions_Short")
+  
+  return(df)
+  
+}
+```
+
+接著把每一個報告結果帶入，所以每個商品都會有一個所有資料的data frame。
+
+```{r}
+
+df_crude_oil <- combin(report_crude_oil)
+df_natural_gas <- combin(report_natural_gas)
+df_corn <- combin(report_corn)
+df_soybean <- combin(report_soybean)
+df_sugar <- combin(report_sugar)
+df_wheat <- combin(report_wheat)
+
+```
+
+```{r}
+head(df_crude_oil)
+```
+
+### Export
+
+為了將結果合併輸出成excel檔案，我們將這些結果的data frame合併成一個list，並且可以指定list中每一個元素的名稱。最後使用`write.xlsx`函數將這個list放入，接著指定輸出的檔名為`CFTC Future Price.xlsx`。若放入的物件是data frame，則在excel中會是一張工作表中一個data frame，但若是放入由data frame組成的list，excel就會呈現很多張工作表，每張工作表一個data frame。
+
+```{r}
+df <- list(crude_oil = df_crude_oil, 
+           natural_gas = df_natural_gas, 
+           corn = df_corn, 
+           soybean = df_soybean, 
+           sugar = df_sugar, 
+           wheat = df_wheat)
+```
+
+```{r}
+write.xlsx(df, "CFTC Future Price.xlsx")
+```
